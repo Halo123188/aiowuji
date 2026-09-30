@@ -1,0 +1,14 @@
+/.venv/
+/build/
+/dist/
+/*.egg-info/
+/src/*.egg-info/
+__pycache__/
+*.py[cod]
+*.so
+*.dSYM/
+
+references/
+.DS_Store
+
+logs/

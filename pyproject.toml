@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiowuji"
+version = "0.1.0"
+description = "Asyncio joint control for the Wuji Hand 2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Younghyo Park" }]
+dependencies = [
+    # Both distributions provide `import wuji_sdk`: the official SDK on Linux,
+    # and the pinned Apple Silicon port on macOS.
+    "wuji-sdk>=2026.9.22; sys_platform == 'linux'",
+    "wuji-macos==0.1.0.dev0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy",
+    "ruckig",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+plot = ["matplotlib"]
+
+[project.urls]
+Homepage = "https://github.com/younghyopark/aiowuji"
+Repository = "https://github.com/younghyopark/aiowuji"
+
+[project.scripts]
+aiowuji = "aiowuji.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
