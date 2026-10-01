@@ -21,10 +21,12 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
-# Kinematic collision checks with the bundled Wuji Hand 2 model (scripts/sysid_ref_collect.py).
+# The bundled Wuji Hand 2 model: clearance checks (scripts/sysid_ref_collect.py) and aiowuji.sim.
 sim = ["mujoco"]
 # scripts/sysid_ref_collect.py: collision-aware planning and progress bars.
 sysid = ["mujoco", "tqdm"]
+# scripts/sysid_fit.py: batched MuJoCo rollouts (mjbatch pins its own mujoco) and plots.
+fit = ["mjbatch", "tqdm", "matplotlib"]
 
 [project.urls]
 Homepage = "https://github.com/younghyopark/aiowuji"

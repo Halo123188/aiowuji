@@ -166,6 +166,65 @@ Their joints are aiowuji's joints in the same order and with the same limits.
 how close a finger comes to the rest of the hand, which the sysid collector uses
 to plan collision-free trajectories. It needs `pip install "aiowuji[sim]"`.
 
+### Simulation and system identification
+
+`scripts/sysid_fit.py` fits the bundled model to a `sysid_ref_collect.py` run
+with [mjbatch](https://github.com/kevinzakka/mjbatch) and writes one MuJoCo
+model of the whole hand. Pass how the hand was mounted, since gravity loads the
+joints (`fingers-up`, `fingers-down`, `palm-up`, `palm-down`, or `--gravity X Y
+Z` in the wrist frame):
+
+```bash
+pip install -e ".[fit]"   # mjbatch pins its own mujoco version
+python scripts/sysid_fit.py --mount fingers-up   # the newest logs/sysid-*
+```
+
+The fitted model's actuators are motors: `ctrl` is motor current (A) and `gear`
+is the joint's torque constant (N·m/A). The PD is not in the model:
+`aiowuji.sim.firmware_effort` reproduces the hand's, whose constants the fit
+first measures from the recorded effort. On firmware 2.10.0 the hand applies
+about 1.95 times the documented law, clipped at `effort_limit`, 2 ms after a
+target is sent:
+`effort = clip(1.95 kp (q_desired - q) + 1.9 kd (qd_desired - qd), ±effort_limit)`.
+
+For each finger the fit then finds every joint's `armature`, `damping`,
+`frictionloss`, `stiffness` and `springref`, shared by all gain settings. It
+replays the recorded targets through that PD at 1 kHz for many parameter sets
+at once and searches them with CMA-ES, starting from a least-squares fit of the
+measured effort. The joints turn out to carry a passive spring: with the fingers
+up, gravity pulls a bent finger further, yet the effort needed to hold it points
+back toward straight. Friction uses the stiffest constraint MuJoCo allows at
+1 ms steps (`solreffriction` 2 ms), since MuJoCo's default lets a stuck joint
+creep. `--holdout KP:KD` leaves a gain setting out to test generalization.
+MuJoCo's joint friction is Coulomb only, while the hand breaks away above its
+sliding friction; the largest errors are therefore the stick-slip jumps at low
+gains (kp 1.5).
+
+The motion without contact depends only on these parameters divided by the
+gear, so the gear cannot be identified from one mount: a linear spring stands
+in for gravity. It defaults to the vendor model's torque limits over the 2 A
+current ceiling. `--fit-gear` fits a scale per finger, which needs recordings
+from two mounts (pass several runs as `RUN:MOUNT`) to be meaningful.
+
+The fit writes `wuji_hand2_<side>.xml` (with `meshes/`), `params.json` (the
+firmware law, every joint's parameters, and the error per trial and joint), and
+`plots/` under `<run>/fit/`. `aiowuji.sim.WujiSim` runs it with 50 Hz targets
+over 1 kHz physics, the PD running every physics step:
+
+```python
+from aiowuji.sim import WujiSim
+
+sim = WujiSim("logs/sysid-.../fit/wuji_hand2_right.xml", kp=3.0, kd=0.05, control_hz=50)
+for target in trajectory:
+    sim.step(target)  # 20 physics steps; the target takes effect after the 2 ms lag
+```
+
+The model's world gravity is the default −z and its fingers point along −z, so
+it hangs fingers down; set `sim.model.opt.gravity` (or mount the hand in your
+scene) to match your setup. For many simulations, call `firmware_effort` on an
+mjbatch `Batch`'s bound `qpos`/`qvel` and write the result to `ctrl` before each
+`step()`.
+
 ### Units
 
 The Wuji SDK expresses effort as motor current in amperes (its torque constant
