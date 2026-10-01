@@ -1,5 +1,17 @@
 # aiowuji
 
+<div align="center">
+  <img width="340" src="assets/image.png">
+</div>
+<p align="center">
+  <a href="https://pypi.org/project/aiowuji/">
+    <img src="https://img.shields.io/pypi/v/aiowuji" alt="PyPI">
+  </a>
+  <a href="https://opensource.org/licenses/MIT">
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT">
+  </a>
+</p>
+
 **aiowuji** is an experimental asyncio-based Python library for joint control
 of the **Wuji Hand 2** on Linux and Apple Silicon macOS. It streams joint
 targets to the hand's firmware PD controller from a 1 kHz background loop,
@@ -111,10 +123,15 @@ to an emergency stop, and only then restores the gains the hand had before.
 While the loop runs, aiowuji lowers Python's thread switch interval to 0.5 ms
 (`sys.setswitchinterval`) so the loop thread is not stalled for 5 ms by other
 Python threads, and restores it on `stop()`. The loop thread also asks for
-better scheduling: QoS class `USER_INTERACTIVE` on macOS, as aiofranka does,
-which keeps it on performance cores, and `SCHED_FIFO` priority 80 on Linux when
-permitted (root or `CAP_SYS_NICE`). `controller.thread_priority` reports what
-it got; pass `realtime_priority=False` to skip this.
+better scheduling. On macOS it takes QoS class `USER_INTERACTIVE`, as aiofranka
+does, which keeps it on performance cores, and then the Mach real-time
+(time-constraint) policy that Core Audio threads use: it declares its period, a
+CPU budget of half the period and a deadline of 90% of it, runs ahead of every
+QoS class, and is demoted to normal priority if it overruns the budget. No root
+is needed. On Linux it asks for `SCHED_FIFO` priority 80 when permitted (root or
+`CAP_SYS_NICE`). `controller.thread_priority` reports what it got
+(`mach_realtime`, `qos_user_interactive`, `sched_fifo_80` or `default`); pass
+`realtime_priority=False` to skip this.
 
 ### Recording
 
@@ -122,7 +139,32 @@ it got; pass `realtime_priority=False` to skip this.
 `controller.stop_recording()`, which returns NumPy arrays: when each tick ran
 and was due, time spent sending, the command sent, and the newest telemetry.
 `scripts/log_move.py` runs the `00_move.py` sequence with recording on and
-saves the result under `logs/`.
+saves the result under `logs/`. `scripts/sysid_ref_collect.py` collects data
+for simulator system identification: for each finger and each `kp:kd` setting,
+the finger's four joints track one continuous 21.6 s trajectory, all at once
+(steps, slow sines at the maximum amplitude, and a multisine whose harmonics are
+interleaved across the joints so each joint's response can be separated, with
+the speed capped at 2 rad/s). The trajectories are planned against the bundled
+Wuji Hand 2 model so the finger keeps 5 mm (`--margin`) from the other fingers
+and the palm: the other fingers spread away from it (`--spread`), each joint's
+amplitude is capped to its collision-free range, and segments that would still
+come too close are scaled down. `--plan` prints the result. Before every trial
+the hand moves home and then to the trial's pose with stiff gains. Every trial's
+per-tick recording is saved under `logs/sysid-<UTC time>/` with a
+`manifest.json`; the default run (5 fingers, 3 settings) takes about 6 minutes
+and needs MuJoCo and tqdm (`pip install "aiowuji[sysid]"`). `--plan` prints the trials and the estimated time, and
+`--resume [DIR]` continues a stopped run (the newest by default) after checking
+that its recorded trials match the plan for the options given.
+
+### Hand model
+
+`src/aiowuji/models/wuji_hand2` bundles Wuji Technology's official Wuji Hand 2
+(Beta 2) MuJoCo models, left and right, unmodified from
+[wuji-description](https://github.com/wuji-technology/wuji-description) (MIT).
+Their joints are aiowuji's joints in the same order and with the same limits.
+`aiowuji.model.HandModel` poses a model with the 20 joint angles and measures
+how close a finger comes to the rest of the hand, which the sysid collector uses
+to plan collision-free trajectories. It needs `pip install "aiowuji[sim]"`.
 
 ### Units
 
@@ -135,6 +177,9 @@ value used by the vendor examples.
 
 The loop disables the hand when `joint_states` stop arriving for `stale_ms`
 (20 ms), a joint drops out, or a joint reports a fault or leaves Enabled.
+A parameter write (gains, enable) holds the hand's telemetry back for up to
+about 20 ms: frames arrive late, none are lost. While aiowuji's own write is in
+flight and for 100 ms after it, telemetry may be up to 150 ms old.
 Passing `max_tracking_error` (rad) also stops it when an impedance-mode joint
 falls that far behind its target; it is off by default, since fast moves lag
 and pushing a held finger is often the point. `effort_limit` bounds the push.
@@ -191,7 +236,8 @@ controller.kd = np.ones(controller.dof) * 0.05
 await controller.set("q_desired", target_qpos)
 ```
 
-Setting `kp` or `kd` sends the gains to the hand immediately.
+Setting `kp` or `kd` sends the gains to the hand immediately, one write each;
+`controller.set_gains(kp=..., kd=...)` sends both in a single write.
 
 **Use case**: compliant joint-space holding and trajectory tracking.
 
@@ -262,7 +308,6 @@ python examples/00_move.py <HAND_SN>
 python examples/01_joint_impedance.py <HAND_SN>
 python examples/02_host_pd.py <HAND_SN>
 python examples/03_zero_torque.py <HAND_SN>
-python examples/04_joint_impedance_sine.py <HAND_SN>
 ```
 
 Every example enables the motors. `00_move.py` goes finger by finger, moving
@@ -273,11 +318,6 @@ spring back. `02_host_pd.py` does the same with the PD law run in Python
 through torque mode.
 `03_zero_torque.py` enables with zero current so the fingers can be moved by
 hand.
-`04_joint_impedance_sine.py` measures the impedance response: from the home
-pose (all zeros, fingers straight) it drives each of the 20 joints in turn
-through one sine period (±0.3 rad at 1 Hz by default) and saves one figure
-under `logs/` with target against measured angle for every joint. Pass `--kp`
-and `--kd` to compare gains (needs matplotlib: `pip install "aiowuji[plot]"`).
 
 To test the loop without enabling anything, pass `dry_run=True`: aiowuji
 connects and runs the loop but does not change gains, enable, or send commands.

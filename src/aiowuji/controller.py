@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import os
 import sys
@@ -15,29 +16,68 @@ from .transport import open_transport
 # Upper bound for effort_limit (A): the value used by the vendor examples.
 MAX_EFFORT_LIMIT = 1.5
 SWITCH_INTERVAL_S = 0.0005
+# A parameter write (gains, enable) holds the hand's joint_states back for up to
+# about 20 ms (frames arrive late, none lost). While one is in flight and for
+# WRITE_GRACE_S after it, telemetry may be up to WRITE_STALE_MS old.
+WRITE_GRACE_S = 0.1
+WRITE_STALE_MS = 150.0
 _READY, _ENABLED, _STOPPED = 1, 2, 3
 _TARGETS = ("q_desired", "qd_desired", "effort_ff", "torque")
 
 
-def _prioritize_current_thread() -> str:
+class _TimeConstraint(ctypes.Structure):
+    """Mach thread_time_constraint_policy_data_t; times in mach absolute units."""
+    _fields_ = [("period", ctypes.c_uint32), ("computation", ctypes.c_uint32),
+                ("constraint", ctypes.c_uint32), ("preemptible", ctypes.c_int)]
+
+
+class _Timebase(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+def _mach_realtime(libc, period_s: float) -> bool:
+    """Put the calling thread in the Mach real-time band, as Core Audio threads are.
+
+    It declares a period, a CPU budget per period (half of it) and a deadline
+    (90% of it); the kernel schedules it ahead of every QoS class and demotes
+    it to normal priority if it overruns the budget. No root needed.
+    """
+    timebase = _Timebase()
+    libc.mach_timebase_info(ctypes.byref(timebase))
+    ticks = lambda seconds: int(seconds * 1e9 * timebase.denom / timebase.numer)
+    policy = _TimeConstraint(ticks(period_s), ticks(0.5 * period_s), ticks(0.9 * period_s), 1)
+    libc.pthread_self.restype = ctypes.c_void_p
+    libc.pthread_mach_thread_np.argtypes = [ctypes.c_void_p]
+    libc.pthread_mach_thread_np.restype = ctypes.c_uint32
+    libc.thread_policy_set.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    THREAD_TIME_CONSTRAINT_POLICY, COUNT = 2, 4
+    thread = libc.pthread_mach_thread_np(libc.pthread_self())
+    return libc.thread_policy_set(thread, THREAD_TIME_CONSTRAINT_POLICY, ctypes.byref(policy), COUNT) == 0
+
+
+def _prioritize_current_thread(period_s: float) -> str:
     """Give the calling thread the best scheduling the OS allows without setup.
 
-    macOS: QoS class USER_INTERACTIVE, which keeps the thread on performance
-    cores with minimal timer coalescing (as aiofranka does). Linux: SCHED_FIFO
-    priority 80 when permitted (root or CAP_SYS_NICE). Returns what was applied.
+    macOS: QoS class USER_INTERACTIVE (performance cores, minimal timer
+    coalescing), then the Mach real-time policy for a loop of `period_s`.
+    Linux: SCHED_FIFO priority 80 when permitted (root or CAP_SYS_NICE).
+    Returns what was applied.
     """
+    applied = "default"
     if sys.platform == "darwin":
         QOS_CLASS_USER_INTERACTIVE = 0x21
         libc = ctypes.CDLL(None)
         if libc.pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0:
-            return "qos_user_interactive"
+            applied = "qos_user_interactive"
+        if _mach_realtime(libc, period_s):
+            applied = "mach_realtime"
     elif sys.platform.startswith("linux"):
         try:
             os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(80))
-            return "sched_fifo_80"
+            applied = "sched_fifo_80"
         except (PermissionError, OSError):
             pass
-    return "default"
+    return applied
 
 
 class _Recording:
@@ -132,6 +172,7 @@ class WujiController:
         self.dry_run = bool(dry_run)
         self.realtime_priority = bool(realtime_priority)
         self.thread_priority: str | None = None  # what the loop thread got
+        self._write_grace_until = 0.0  # perf_counter_ns until which a write may delay telemetry
         self.device_name = device_name
         self._transport_kind = transport
         # Firmware joint feed-forward (constant, velocity table and position
@@ -177,8 +218,7 @@ class WujiController:
 
     @kp.setter
     def kp(self, value) -> None:
-        self._kp = _as_vector(value, "kp", nonnegative=True)
-        self._sync_gains()
+        self.set_gains(kp=value)
 
     @property
     def kd(self) -> np.ndarray:
@@ -186,7 +226,13 @@ class WujiController:
 
     @kd.setter
     def kd(self, value) -> None:
-        self._kd = _as_vector(value, "kd", nonnegative=True)
+        self.set_gains(kd=value)
+
+    def set_gains(self, kp=None, kd=None) -> None:
+        """Set kp and/or kd (scalar or per joint) with a single write to the hand."""
+        new_kp = self._kp if kp is None else _as_vector(kp, "kp", nonnegative=True)
+        new_kd = self._kd if kd is None else _as_vector(kd, "kd", nonnegative=True)
+        self._kp, self._kd = new_kp, new_kd
         self._sync_gains()
 
     @property
@@ -293,7 +339,8 @@ class WujiController:
         time.sleep(0.02)
         requested = time.perf_counter_ns()
         self._enable_requested = True
-        self.hand.enable()
+        with self._writing():
+            self.hand.enable()
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and self.error is None:
             received, status = self._status
@@ -484,8 +531,18 @@ class WujiController:
             self._motion[3].set()
             self._motion = None
 
+    @contextlib.contextmanager
+    def _writing(self):
+        """Mark a write to the hand, which delays its joint_states while it runs."""
+        self._write_grace_until = float("inf")
+        try:
+            yield
+        finally:
+            self._write_grace_until = time.perf_counter_ns() + WRITE_GRACE_S * 1e9
+
     def _push_gains(self, kp, kd) -> None:
-        self.hand.mit_params().set([(float(p), float(d)) for p, d in zip(kp, kd)])
+        with self._writing():
+            self.hand.mit_params().set([(float(p), float(d)) for p, d in zip(kp, kd)])
 
     def _sync_gains(self) -> None:
         if self._saved_gains is not None and self._mode == "impedance" and not self._shut_down:
@@ -523,9 +580,9 @@ class WujiController:
 
     def _run(self) -> None:
         period = round(1e9 / self.rate_hz)
-        stale_ns = self.stale_ms * 1e6
+        stale_ns, write_stale_ns = self.stale_ms * 1e6, WRITE_STALE_MS * 1e6
         if self.realtime_priority:
-            self.thread_priority = _prioritize_current_thread()
+            self.thread_priority = _prioritize_current_thread(1.0 / self.rate_hz)
         deadline = previous = time.perf_counter_ns()
         last_state = self.state["host_ns"]
         tick = 0
@@ -549,7 +606,7 @@ class WujiController:
                         return self._fail("a joint is missing from joint_states")
                     self._set_state(state)
                     last_state = now
-                if now - last_state > stale_ns:
+                if now - last_state > (write_stale_ns if now < self._write_grace_until else stale_ns):
                     return self._fail(f"no joint_states for {(now - last_state) / 1e6:.1f} ms")
                 if tick % self.transport.status_every == 0:
                     status = self.transport.latest_status()

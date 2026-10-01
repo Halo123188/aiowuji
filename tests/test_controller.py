@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -171,7 +172,7 @@ class ControllerTests(unittest.TestCase):
 
         controller, ticks = run(scenario())
         if sys.platform == "darwin":
-            self.assertEqual(controller.thread_priority, "qos_user_interactive")
+            self.assertEqual(controller.thread_priority, "mach_realtime")
         n = len(ticks["tick_ns"])
         self.assertGreater(n, 50)
         self.assertTrue(all(len(values) == n for values in ticks.values()))
@@ -251,6 +252,47 @@ class ControllerTests(unittest.TestCase):
 
         run(scenario())
         self.assertIn("disable", hand.calls)
+
+    def test_set_gains_writes_once(self) -> None:
+        hand = FakeHand()
+
+        async def scenario():
+            controller = WujiController(hand, transport="sdk")
+            await controller.start()
+            before = len(hand.calls)
+            controller.set_gains(kp=5.0, kd=0.2)
+            self.assertEqual(hand.calls[before:], [("mit_params", (5.0, 0.2))])
+            await controller.stop()
+
+        run(scenario())
+
+    def test_telemetry_held_back_by_a_write_is_tolerated(self) -> None:
+        # The hand delays joint_states while it services a parameter write; a
+        # 60 ms hold during a gain write must not trip the 20 ms stale limit.
+        hand = FakeHand()
+        write = hand.mit_params
+
+        def slow_mit_params():
+            resource = write()
+
+            def set_gains(pairs):
+                hand.streaming = False
+                time.sleep(0.06)
+                resource.set(pairs)
+                hand.streaming = True
+            return SimpleNamespace(get=resource.get, set=set_gains)
+        hand.mit_params = slow_mit_params
+
+        async def scenario():
+            controller = WujiController(hand, transport="sdk")
+            await controller.start()
+            controller.set_gains(kp=4.0, kd=0.1)
+            await controller.wait(0.2)
+            await controller.stop()
+            return controller
+
+        controller = run(scenario())
+        self.assertIsNone(controller.error)
 
     def test_warnings_are_collected_and_faults_disable(self) -> None:
         hand = FakeHand()
