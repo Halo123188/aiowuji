@@ -44,18 +44,10 @@ SDK distributions provide `import wuji_sdk`:
 | Platform | SDK distribution |
 | --- | --- |
 | Linux x86_64 / aarch64 (glibc 2.34+) | [`wuji-sdk`](https://pypi.org/project/wuji-sdk/) 2026.9.22+, the official Python SDK |
-| macOS on Apple Silicon | [`wuji-macos`](https://github.com/younghyopark/wuji-macos-sdk), a port of the Wuji SDK 2026.9.22 native code |
+| macOS on Apple Silicon | [`wuji-macos`](https://pypi.org/project/wuji-macos/), a port of the Wuji SDK 2026.9.22 native code |
 
 Hand firmware 2.7.0 and later only accepts SDK connections on port 50001, which
 needs SDK 2026.9.22 or later.
-
-`wuji-macos` is not on PyPI yet. Build it from
-[younghyopark/wuji-macos-sdk](https://github.com/younghyopark/wuji-macos-sdk)
-(`python scripts/build_macos.py`), then point pip at the wheel:
-
-```bash
-pip install --find-links /path/to/wuji-macos-sdk/dist -e .
-```
 
 On macOS aiowuji keeps SDK users and calibrations in `~/.wuji`, as the official
 SDK does on Linux. Set `WUJI_MACOS_STATE_DIR` to use another directory.

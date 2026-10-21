@@ -14,7 +14,7 @@ dependencies = [
     # Both distributions provide `import wuji_sdk`: the official SDK on Linux,
     # and the pinned Apple Silicon port on macOS.
     "wuji-sdk>=2026.9.22; sys_platform == 'linux'",
-    "wuji-macos==0.1.0.dev0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "wuji-macos==0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy",
     "ruckig",
 ]
