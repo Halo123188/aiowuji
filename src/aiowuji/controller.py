@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from .hand import DOF, connect, import_sdk, outside_limits
+from .hand import DOF, JOINT_NIDS, connect, import_sdk, outside_limits
 from .transport import open_transport
 
 # Upper bound for effort_limit (A): the value used by the vendor examples.
@@ -135,6 +135,10 @@ class WujiController:
     `max_tracking_error` is set (rad; off by default), the impedance tracking
     error exceeds it. Firmware warnings such as Stall are collected in
     `warnings` instead.
+
+    `disabled_joints` (flat joint indices, 0-19) are never enabled: they hang
+    limp, and their state and faults are ignored, so a hand with one faulty
+    joint can still run on the others. They are still read and commanded.
     """
 
     def __init__(
@@ -153,6 +157,7 @@ class WujiController:
         realtime_priority: bool = True,
         device_name: str = "aiowuji",
         feed_forward: bool | None = None,
+        disabled_joints=(),
     ) -> None:
         if not 0.0 <= effort_limit <= MAX_EFFORT_LIMIT:
             raise ValueError(f"effort_limit must be within [0, {MAX_EFFORT_LIMIT}] A")
@@ -178,6 +183,12 @@ class WujiController:
         # Firmware joint feed-forward (constant, velocity table and position
         # table); None leaves the hand's current setting untouched.
         self.feed_forward = None if feed_forward is None else bool(feed_forward)
+        self.disabled_joints = tuple(sorted({int(i) for i in disabled_joints}))
+        if any(not 0 <= i < DOF for i in self.disabled_joints):
+            raise ValueError(f"disabled_joints must be joint indices within [0, {DOF})")
+        self._disabled_nids = {JOINT_NIDS[i] for i in self.disabled_joints}
+        self._active = np.ones(DOF, dtype=bool)
+        self._active[list(self.disabled_joints)] = False
 
         self.hand = None
         self.transport = None
@@ -294,7 +305,7 @@ class WujiController:
             raise RuntimeError("no joint_states/joint_diagnostics within 2 s")
         if None in state.qpos:
             raise RuntimeError("joint_states is missing joints")
-        not_ready = [s.nid for s in status if s.ext_state != _READY]
+        not_ready = [s.nid for s in status if s.ext_state != _READY and s.nid not in self._disabled_nids]
         faults = self._faults(status)
         if not_ready or faults or len(status) != DOF:
             raise RuntimeError(f"refusing to start: not Ready {not_ready}, faults {faults}")
@@ -340,11 +351,15 @@ class WujiController:
         requested = time.perf_counter_ns()
         self._enable_requested = True
         with self._writing():
-            self.hand.enable()
+            if self.disabled_joints:
+                self.hand.enable([int(a) for a in self._active])
+            else:
+                self.hand.enable()
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and self.error is None:
             received, status = self._status
-            if received > requested and all(s.ext_state == _ENABLED for s in status):
+            if received > requested and all(s.ext_state == _ENABLED for s in status
+                                            if s.nid not in self._disabled_nids):
                 self._enabled = True
                 return
             time.sleep(0.005)
@@ -556,6 +571,8 @@ class WujiController:
     def _faults(self, status) -> list[str]:
         faults = []
         for joint in status:
+            if joint.nid in self._disabled_nids:
+                continue
             if joint.error_code:
                 info = self._describe(joint.error_code)
                 if info is not None and info["severity"] == "Warning":
@@ -631,7 +648,7 @@ class WujiController:
                         command = (q, np.zeros(DOF), self.torque)
                     tracking = self._mode == "impedance" and self._enabled
                 if tracking:
-                    error = float(np.max(np.abs(command[0] - q)))
+                    error = float(np.max(np.abs(command[0] - q)[self._active]))
                     self.stats["max_tracking_error"] = max(self.stats["max_tracking_error"], error)
                     if self.max_tracking_error is not None and error > self.max_tracking_error:
                         return self._fail(f"tracking error {error:.3f} rad exceeds {self.max_tracking_error:.3f}")

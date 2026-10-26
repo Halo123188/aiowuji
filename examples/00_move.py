@@ -18,6 +18,8 @@ async def main() -> int:
     parser.add_argument("--max-acceleration", type=float, default=10.0, help="rad/s^2 (default 10)")
     parser.add_argument("--max-jerk", type=float, default=100.0, help="rad/s^3 (default 100)")
     parser.add_argument("--cycles", type=int, default=3, help="out-and-back strokes per finger (default 3)")
+    parser.add_argument("--disabled-joints", type=int, nargs="*", default=[],
+                        help="joint indices (0-19) to leave disabled and skip, e.g. 17 for pinky_S2")
     args = parser.parse_args()
 
     # The defaults reach 2 rad/s in about 0.3 s: each 1.0 rad stroke takes
@@ -25,8 +27,9 @@ async def main() -> int:
     # joints stick and slip (see the README), so slow moves look stepped.
     speed = dict(max_velocity=args.max_velocity, max_acceleration=args.max_acceleration, max_jerk=args.max_jerk)
     joints = [finger * 4 + args.slot - 1 for finger in range(len(FINGERS))]
+    joints = [joint for joint in joints if joint not in args.disabled_joints]
 
-    controller = WujiController(args.hand_sn)
+    controller = WujiController(args.hand_sn, disabled_joints=args.disabled_joints)
     await controller.start()
     try:
         q0 = controller.initial_qpos.copy()

@@ -119,11 +119,68 @@ class FakeHand:
         self.ext_state = 3
 
 
+class FaultyJointHand(FakeHand):
+    """A hand whose joint `bad` (flat index) is latched in a fault and never enables."""
+
+    def __init__(self, bad: int) -> None:
+        super().__init__()
+        self.bad = bad
+        self.states = [1] * 20
+        self.states[bad] = 3
+
+    def _diagnostics(self):
+        return SimpleNamespace(joints=[
+            SimpleNamespace(nid=nid, status_word=SimpleNamespace(ext_state=self.states[j]),
+                            error_code_current=0x2102 if j == self.bad else 0)
+            for j, nid in enumerate(JOINT_NIDS)])
+
+    def enable(self, mask=None) -> None:
+        self.calls.append(("enable", mask))
+        for j in range(20):
+            if j != self.bad and (mask is None or mask[j]):
+                self.states[j] = 2
+
+    def disable(self) -> None:
+        self.calls.append("disable")
+        self.states = [3 if j == self.bad else 1 for j in range(20)]
+
+
 def run(coroutine):
     return asyncio.run(asyncio.wait_for(coroutine, 10))
 
 
 class ControllerTests(unittest.TestCase):
+    def test_disabled_joints_run_the_hand_around_a_faulty_joint(self) -> None:
+        with self.assertRaisesRegex(ValueError, "disabled_joints"):
+            WujiController(FakeHand(), disabled_joints=[20])
+
+        async def refuses():
+            controller = WujiController(FaultyJointHand(17), transport="sdk")
+            with self.assertRaisesRegex(RuntimeError, "refusing to start"):
+                await controller.start()
+            await controller.stop()
+
+        run(refuses())
+        hand = FaultyJointHand(17)
+
+        async def scenario():
+            controller = WujiController(hand, transport="sdk", disabled_joints=[17], max_tracking_error=0.01)
+            await controller.start()
+            mask = [1] * 20
+            mask[17] = 0
+            self.assertIn(("enable", mask), hand.calls)
+            target = controller.initial_qpos.copy()
+            target[16] += 0.05
+            await controller.move(target)
+            await controller.wait(0.05)
+            self.assertIsNone(controller.error)
+            await controller.stop()
+            return controller
+
+        controller = run(scenario())
+        self.assertIsNone(controller.error)
+        self.assertEqual(controller.disabled_joints, (17,))
+
     def test_lifecycle_moves_switches_and_restores_gains(self) -> None:
         hand = FakeHand()
 
